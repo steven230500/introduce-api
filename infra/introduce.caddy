@@ -1,0 +1,6 @@
+# Pega esto en /opt/infra/sites/introduce.caddy del droplet
+# Cambia TU_DOMINIO por el dominio real
+
+api.introduce.TU_DOMINIO.com {
+    reverse_proxy introduce-api-api-1:8080
+}
