@@ -25,7 +25,10 @@ func main() {
 		log.Fatalf("storage init: %v", err)
 	}
 
-	verifier := auth.NewSupabaseVerifier(env("SUPABASE_JWT_SECRET", ""))
+	verifier, err := auth.NewSupabaseVerifier(env("SUPABASE_URL", ""))
+	if err != nil {
+		log.Fatalf("auth init: %v", err)
+	}
 
 	r := chi.NewRouter()
 	r.Use(middleware.Logger)
@@ -35,7 +38,6 @@ func main() {
 
 	r.Get("/health", health.Handler)
 
-	// Serve uploaded files as static
 	uploadsDir := env("UPLOADS_DIR", "./uploads")
 	r.Handle("/files/*", http.StripPrefix("/files/", http.FileServer(http.Dir(uploadsDir))))
 
