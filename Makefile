@@ -1,19 +1,32 @@
-.PHONY: run build docker-build docker-push deploy
-
-IMAGE := ghcr.io/steven230500/introduce-api
+.PHONY: run build test lint fmt tidy check docker-up docker-down migrate-help
 
 run:
 	go run ./cmd/server
 
 build:
-	CGO_ENABLED=0 go build -o introduce-api ./cmd/server
+	go build -o bin/server ./cmd/server
 
-docker-build:
-	docker build -t $(IMAGE):latest .
+test:
+	go test ./... -count=1
 
-docker-push: docker-build
-	docker push $(IMAGE):latest
+# Integration tests need a throwaway Postgres; they skip themselves without it.
+test-integration:
+	INTRODUCE_TEST_DB="postgres://introduce:introduce@localhost:5433/introduce_test?sslmode=disable" \
+		go test ./... -count=1 -tags=integration
 
-# Run on droplet: ssh root@159.203.110.122 "cd /opt/introduce && docker compose pull && docker compose up -d"
-deploy:
-	ssh root@159.203.110.122 "cd /opt/introduce && docker compose pull && docker compose up -d"
+fmt:
+	gofmt -w cmd internal
+
+lint:
+	go vet ./...
+
+tidy:
+	go mod tidy
+
+check: fmt lint test
+
+docker-up:
+	docker compose up -d --build
+
+docker-down:
+	docker compose down

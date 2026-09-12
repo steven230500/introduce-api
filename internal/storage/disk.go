@@ -8,8 +8,8 @@ import (
 )
 
 type DiskStore struct {
-	baseDir    string
-	baseURL    string
+	baseDir string
+	baseURL string
 }
 
 func NewDisk(baseDir, baseURL string) (*DiskStore, error) {

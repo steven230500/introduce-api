@@ -1,21 +1,50 @@
 services:
+  db:
+    image: postgres:17-alpine
+    restart: unless-stopped
+    environment:
+      POSTGRES_USER: ${POSTGRES_USER:-introduce}
+      POSTGRES_PASSWORD: ${POSTGRES_PASSWORD:?set POSTGRES_PASSWORD in .env}
+      POSTGRES_DB: ${POSTGRES_DB:-introduce}
+    volumes:
+      - pgdata:/var/lib/postgresql/data
+      # Nightly dumps land here; back this directory up off the droplet.
+      - ./backups:/backups
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U ${POSTGRES_USER:-introduce}"]
+      interval: 10s
+      timeout: 5s
+      retries: 10
+    networks:
+      - internal
+
   api:
     image: ghcr.io/steven230500/introduce-api:latest
     restart: unless-stopped
+    depends_on:
+      db:
+        condition: service_healthy
     environment:
       PORT: 8080
       UPLOADS_DIR: /uploads
       FILES_BASE_URL: ${FILES_BASE_URL}
-      SUPABASE_URL: ${SUPABASE_URL}
+      DATABASE_URL: postgres://${POSTGRES_USER:-introduce}:${POSTGRES_PASSWORD}@db:5432/${POSTGRES_DB:-introduce}?sslmode=disable
+      JWT_SECRET: ${JWT_SECRET:?set JWT_SECRET in .env, at least 32 characters}
+      ALLOWED_ORIGIN: ${ALLOWED_ORIGIN:-*}
     volumes:
       - uploads:/uploads
     networks:
+      - internal
       - infra_network
 
 volumes:
+  pgdata:
   uploads:
 
 networks:
+  # Postgres is only reachable from the api container: it publishes no port to
+  # the host and is not on the public-facing network.
+  internal:
   infra_network:
     external: true
     name: infra_infra_network
