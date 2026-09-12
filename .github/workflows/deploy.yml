@@ -31,14 +31,24 @@ jobs:
           push: true
           tags: ${{ env.IMAGE }}:latest
 
+      # The deploy key is restricted on the droplet to exactly this command,
+      # so a leak of the secret cannot be used as a general shell.
       - name: Deploy to droplet
         uses: appleboy/ssh-action@v1
         with:
           host: ${{ secrets.DROPLET_HOST }}
-          username: root
+          username: ${{ secrets.DROPLET_USER }}
           key: ${{ secrets.DROPLET_SSH_KEY }}
-          script: |
-            cd /opt/introduce
-            docker compose pull
-            docker compose up -d
-            docker image prune -f
+          script: deploy
+
+      - name: Wait for the API to answer
+        run: |
+          for attempt in $(seq 1 20); do
+            if curl -fsS -m 10 https://api.introduce.casavidactg.com/health; then
+              echo "deploy healthy"
+              exit 0
+            fi
+            sleep 5
+          done
+          echo "the API never came back after the deploy"
+          exit 1
