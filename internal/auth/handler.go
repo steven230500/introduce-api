@@ -24,6 +24,7 @@ func (h *Handler) PublicRouter() chi.Router {
 func (h *Handler) PrivateRouter() chi.Router {
 	r := chi.NewRouter()
 	r.Get("/me", h.me)
+	r.Post("/password", h.changePassword)
 	r.Post("/logout", h.logout)
 	return r
 }
@@ -86,6 +87,25 @@ func (h *Handler) me(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	httpx.JSON(w, http.StatusOK, map[string]any{"user": user, "org_id": orgID})
+}
+
+func (h *Handler) changePassword(w http.ResponseWriter, r *http.Request) {
+	var body struct {
+		CurrentPassword string `json:"current_password"`
+		NewPassword     string `json:"new_password"`
+	}
+	if err := httpx.Decode(r, &body); err != nil {
+		httpx.WriteError(w, err)
+		return
+	}
+	userID, _ := UserID(r.Context())
+	if err := h.svc.ChangePassword(
+		r.Context(), userID, body.CurrentPassword, body.NewPassword); err != nil {
+		httpx.WriteError(w, err)
+		return
+	}
+	// Every session is gone, including this one: the client must sign in again.
+	httpx.NoContent(w)
 }
 
 func (h *Handler) logout(w http.ResponseWriter, r *http.Request) {

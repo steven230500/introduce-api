@@ -98,6 +98,42 @@ func (s *Service) Refresh(ctx context.Context, refreshToken string) (Session, er
 	return s.newSession(ctx, user)
 }
 
+// ChangePassword swaps the password after checking the current one.
+//
+// Every other session is revoked afterwards. A password change is usually a
+// response to a suspected leak, so leaving other sessions alive would defeat
+// the point.
+func (s *Service) ChangePassword(
+	ctx context.Context,
+	userID uuid.UUID,
+	currentPassword, newPassword string,
+) error {
+	user, err := s.repo.UserByID(ctx, userID)
+	if err != nil {
+		return err
+	}
+
+	ok, err := VerifyPassword(currentPassword, user.passwordHash)
+	if err != nil || !ok {
+		return httpx.Fail(
+			http.StatusUnauthorized, "invalid_credentials", "la contraseña actual no coincide")
+	}
+
+	if len([]rune(newPassword)) < 8 {
+		return httpx.Fail(
+			http.StatusBadRequest, "weak_password", "la contraseña necesita al menos 8 caracteres")
+	}
+
+	hash, err := HashPassword(newPassword)
+	if err != nil {
+		return err
+	}
+	if err := s.repo.UpdatePassword(ctx, userID, hash); err != nil {
+		return err
+	}
+	return s.repo.RevokeAllForUser(ctx, userID)
+}
+
 // Logout ends every session for the user.
 func (s *Service) Logout(ctx context.Context, userID uuid.UUID) error {
 	return s.repo.RevokeAllForUser(ctx, userID)

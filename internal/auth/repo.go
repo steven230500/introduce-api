@@ -101,6 +101,19 @@ func (r *Repo) ConsumeRefreshToken(ctx context.Context, hash []byte) (uuid.UUID,
 	return userID, err
 }
 
+// UpdatePassword replaces the stored hash.
+func (r *Repo) UpdatePassword(ctx context.Context, userID uuid.UUID, hash string) error {
+	tag, err := r.pool.Exec(ctx,
+		`update users set password_hash = $2 where id = $1`, userID, hash)
+	if err != nil {
+		return err
+	}
+	if tag.RowsAffected() == 0 {
+		return ErrNoRows
+	}
+	return nil
+}
+
 // RevokeAllForUser ends every session, used on sign-out.
 func (r *Repo) RevokeAllForUser(ctx context.Context, userID uuid.UUID) error {
 	_, err := r.pool.Exec(ctx, `
