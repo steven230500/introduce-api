@@ -346,6 +346,23 @@ func (r *Repo) UpdateItem(ctx context.Context, orgID, itemID uuid.UUID, in map[s
 	if v, ok := in["auto_advance_secs"]; ok {
 		add("auto_advance_secs", toIntPtr(v))
 	}
+	// A rename touches one key inside content_json, so it is merged rather than
+	// sent whole: the client would otherwise have to echo back the slide paths
+	// or the sermon points just to change the name, and any drift between what
+	// it holds and what is stored would silently overwrite the stored copy.
+	if v, ok := in["title"]; ok {
+		title, isString := v.(string)
+		if !isString {
+			return httpx.Fail(http.StatusBadRequest, "bad_title", "el nombre debe ser texto")
+		}
+		title = strings.TrimSpace(title)
+		if title == "" {
+			return httpx.Fail(http.StatusBadRequest, "bad_title", "el nombre no puede quedar vacío")
+		}
+		args = append(args, title)
+		sets = append(sets, "content_json = coalesce(content_json, '{}'::jsonb) || "+
+			"jsonb_build_object('title', $"+strconv.Itoa(len(args))+"::text)")
+	}
 	if len(sets) == 0 {
 		return nil
 	}
