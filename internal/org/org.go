@@ -224,6 +224,42 @@ func (r *Repo) SetPalette(ctx context.Context, orgID uuid.UUID, colors []string)
 	return nil
 }
 
+// Notices returns the messages this church keeps ready.
+func (r *Repo) Notices(ctx context.Context, orgID uuid.UUID) ([]Notice, error) {
+	var raw []byte
+	err := r.pool.QueryRow(ctx,
+		`select coalesce(notices, '[]'::jsonb) from organizations where id = $1`, orgID).Scan(&raw)
+	if errors.Is(err, pgx.ErrNoRows) {
+		return nil, httpx.ErrNotFound
+	}
+	if err != nil {
+		return nil, err
+	}
+
+	list := []Notice{}
+	if err := json.Unmarshal(raw, &list); err != nil {
+		// Unreadable is the same as none: the operator can still type one.
+		return []Notice{}, nil
+	}
+	return list, nil
+}
+
+func (r *Repo) SetNotices(ctx context.Context, orgID uuid.UUID, list []Notice) error {
+	encoded, err := json.Marshal(list)
+	if err != nil {
+		return err
+	}
+	tag, err := r.pool.Exec(ctx,
+		`update organizations set notices = $2 where id = $1`, orgID, encoded)
+	if err != nil {
+		return err
+	}
+	if tag.RowsAffected() == 0 {
+		return httpx.ErrNotFound
+	}
+	return nil
+}
+
 func NewHandler(repo *Repo, authRepo *auth.Repo) *Handler {
 	return &Handler{repo: repo, auth: authRepo}
 }
@@ -240,7 +276,81 @@ func (h *Handler) Router() chi.Router {
 	r.Post("/members/{id}/reject", h.reject)
 	r.Get("/palette", h.palette)
 	r.Put("/palette", h.setPalette)
+	r.Get("/notices", h.notices)
+	r.Put("/notices", h.setNotices)
 	return r
+}
+
+// Notice is one of the messages a church shows over and over.
+type Notice struct {
+	Text string `json:"text"`
+	// AutoHideSecs takes it back down on its own. Zero means it stays until
+	// the operator dismisses it, which is what an offering notice wants and a
+	// "children go out now" does not.
+	AutoHideSecs int `json:"auto_hide_secs"`
+}
+
+const (
+	maxNotices    = 20
+	maxNoticeText = 200
+)
+
+func (h *Handler) notices(w http.ResponseWriter, r *http.Request) {
+	orgID, ok := auth.OrgID(r.Context())
+	if !ok {
+		httpx.WriteError(w, httpx.ErrForbidden)
+		return
+	}
+	list, err := h.repo.Notices(r.Context(), orgID)
+	if err != nil {
+		httpx.WriteError(w, err)
+		return
+	}
+	httpx.JSON(w, http.StatusOK, map[string]any{"notices": list})
+}
+
+func (h *Handler) setNotices(w http.ResponseWriter, r *http.Request) {
+	orgID, ok := auth.OrgID(r.Context())
+	if !ok {
+		httpx.WriteError(w, httpx.ErrForbidden)
+		return
+	}
+
+	var body struct {
+		Notices []Notice `json:"notices"`
+	}
+	if err := httpx.Decode(r, &body); err != nil {
+		httpx.WriteError(w, err)
+		return
+	}
+	if len(body.Notices) > maxNotices {
+		httpx.WriteError(w, httpx.Fail(http.StatusBadRequest, "too_many_notices",
+			"demasiados avisos guardados"))
+		return
+	}
+
+	cleaned := make([]Notice, 0, len(body.Notices))
+	for _, n := range body.Notices {
+		n.Text = strings.TrimSpace(n.Text)
+		if n.Text == "" {
+			continue
+		}
+		if len(n.Text) > maxNoticeText {
+			httpx.WriteError(w, httpx.Fail(http.StatusBadRequest, "notice_too_long",
+				"un aviso no puede ser tan largo"))
+			return
+		}
+		if n.AutoHideSecs < 0 || n.AutoHideSecs > 600 {
+			n.AutoHideSecs = 0
+		}
+		cleaned = append(cleaned, n)
+	}
+
+	if err := h.repo.SetNotices(r.Context(), orgID, cleaned); err != nil {
+		httpx.WriteError(w, err)
+		return
+	}
+	httpx.JSON(w, http.StatusOK, map[string]any{"notices": cleaned})
 }
 
 // hexColor is the only shape a stored colour may take.
