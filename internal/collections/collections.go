@@ -54,6 +54,7 @@ type Item struct {
 	ContentJSON     json.RawMessage `json:"content_json"`
 	Notes           *string         `json:"notes"`
 	AutoAdvanceSecs *int            `json:"auto_advance_secs"`
+	PlannedSecs     *int            `json:"planned_secs"`
 	Song            *Song           `json:"songs"`
 }
 
@@ -119,7 +120,7 @@ func (r *Repo) List(ctx context.Context, orgID uuid.UUID) ([]Collection, error) 
 
 	itemRows, err := r.pool.Query(ctx, `
 		select i.id, i.collection_id, i.item_type, i.item_order, i.template_id,
-		       i.content_json, i.notes, i.auto_advance_secs,
+		       i.content_json, i.notes, i.auto_advance_secs, i.planned_secs,
 		       s.id, s.title, s.author, s.copyright, s.ccli_number, s.language, s.tags
 		from collection_items i
 		left join songs s on s.id = i.song_id
@@ -137,7 +138,7 @@ func (r *Repo) List(ctx context.Context, orgID uuid.UUID) ([]Collection, error) 
 		var title, author, copyright, ccli, language *string
 		var tags []string
 		if err := itemRows.Scan(&it.ID, &it.CollectionID, &it.ItemType, &it.ItemOrder,
-			&it.TemplateID, &it.ContentJSON, &it.Notes, &it.AutoAdvanceSecs,
+			&it.TemplateID, &it.ContentJSON, &it.Notes, &it.AutoAdvanceSecs, &it.PlannedSecs,
 			&songID, &title, &author, &copyright, &ccli, &language, &tags); err != nil {
 			return nil, err
 		}
@@ -289,6 +290,7 @@ type ItemInput struct {
 	ContentJSON     json.RawMessage `json:"content_json"`
 	Notes           *string         `json:"notes"`
 	AutoAdvanceSecs *int            `json:"auto_advance_secs"`
+	PlannedSecs     *int            `json:"planned_secs"`
 }
 
 // AddItems appends items to a collection, continuing the existing order.
@@ -322,10 +324,10 @@ func (r *Repo) AddItems(ctx context.Context, orgID, collectionID uuid.UUID, inpu
 		if _, err := tx.Exec(ctx, `
 			insert into collection_items
 			    (collection_id, song_id, template_id, item_order, item_type,
-			     content_json, notes, auto_advance_secs)
-			values ($1, $2, $3, $4, $5, $6, $7, $8)`,
+			     content_json, notes, auto_advance_secs, planned_secs)
+			values ($1, $2, $3, $4, $5, $6, $7, $8, $9)`,
 			collectionID, in.SongID, in.TemplateID, next, itemType,
-			content, in.Notes, in.AutoAdvanceSecs,
+			content, in.Notes, in.AutoAdvanceSecs, plannedOrNil(in.PlannedSecs),
 		); err != nil {
 			return err
 		}
@@ -335,7 +337,18 @@ func (r *Repo) AddItems(ctx context.Context, orgID, collectionID uuid.UUID, inpu
 	return tx.Commit(ctx)
 }
 
-// UpdateItem changes the per-item settings: design, note, auto-advance.
+// plannedOrNil keeps a planned length inside what the column accepts. Out of
+// range means "no plan" rather than a failed save: a rehearsal that timed an
+// item at zero seconds, or a sermon left running over a lunch break, should
+// not stop the rest of the plan being stored.
+func plannedOrNil(secs *int) *int {
+	if secs == nil || *secs < 1 || *secs > 21600 {
+		return nil
+	}
+	return secs
+}
+
+// UpdateItem changes the per-item settings: design, note, auto-advance, plan.
 func (r *Repo) UpdateItem(ctx context.Context, orgID, itemID uuid.UUID, in map[string]any) error {
 	sets := []string{}
 	args := []any{itemID, orgID}
@@ -353,6 +366,10 @@ func (r *Repo) UpdateItem(ctx context.Context, orgID, itemID uuid.UUID, in map[s
 	}
 	if v, ok := in["auto_advance_secs"]; ok {
 		add("auto_advance_secs", toIntPtr(v))
+	}
+	if v, ok := in["planned_secs"]; ok {
+		secs, _ := toIntPtr(v).(*int)
+		add("planned_secs", plannedOrNil(secs))
 	}
 	// A rename touches one key inside content_json, so it is merged rather than
 	// sent whole: the client would otherwise have to echo back the slide paths

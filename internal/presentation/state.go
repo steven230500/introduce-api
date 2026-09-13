@@ -35,6 +35,11 @@ type State struct {
 	// should not need a server release to reach the projector.
 	Waiting json.RawMessage `json:"waiting,omitempty"`
 
+	// Timing is when the item on the screen started, the plan it is counted
+	// against, and whether this is a rehearsal. Opaque here for the same
+	// reason as Waiting.
+	Timing json.RawMessage `json:"timing,omitempty"`
+
 	UpdatedAt time.Time `json:"updated_at"`
 }
 
@@ -50,11 +55,11 @@ func (r *Repo) Get(ctx context.Context, userID uuid.UUID) (State, error) {
 	err := r.pool.QueryRow(ctx, `
 		select collection_id, current_item_index, current_slide_index, is_live,
 		       blank_screen, countdown_active, countdown_end, overlay_visible,
-		       overlay_text, stage_message, waiting, updated_at
+		       overlay_text, stage_message, waiting, timing, updated_at
 		from presentation_state where user_id = $1`, userID,
 	).Scan(&s.CollectionID, &s.CurrentItemIndex, &s.CurrentSlideIndex, &s.IsLive,
 		&s.BlankScreen, &s.CountdownActive, &s.CountdownEnd, &s.OverlayVisible,
-		&s.OverlayText, &s.StageMessage, &s.Waiting, &s.UpdatedAt)
+		&s.OverlayText, &s.StageMessage, &s.Waiting, &s.Timing, &s.UpdatedAt)
 	if errors.Is(err, pgx.ErrNoRows) {
 		return State{UpdatedAt: time.Now()}, nil
 	}
@@ -66,8 +71,8 @@ func (r *Repo) Upsert(ctx context.Context, userID uuid.UUID, s State) (State, er
 		insert into presentation_state (
 			user_id, collection_id, current_item_index, current_slide_index,
 			is_live, blank_screen, countdown_active, countdown_end,
-			overlay_visible, overlay_text, stage_message, waiting
-		) values ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12)
+			overlay_visible, overlay_text, stage_message, waiting, timing
+		) values ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13)
 		on conflict (user_id) do update set
 			collection_id       = excluded.collection_id,
 			current_item_index  = excluded.current_item_index,
@@ -79,11 +84,13 @@ func (r *Repo) Upsert(ctx context.Context, userID uuid.UUID, s State) (State, er
 			overlay_visible     = excluded.overlay_visible,
 			overlay_text        = excluded.overlay_text,
 			stage_message       = excluded.stage_message,
-			waiting             = excluded.waiting
+			waiting             = excluded.waiting,
+			timing              = excluded.timing
 		returning updated_at`,
 		userID, s.CollectionID, s.CurrentItemIndex, s.CurrentSlideIndex,
 		s.IsLive, s.BlankScreen, s.CountdownActive, s.CountdownEnd,
 		s.OverlayVisible, s.OverlayText, s.StageMessage, nullableJSON(s.Waiting),
+		nullableJSON(s.Timing),
 	).Scan(&s.UpdatedAt)
 	return s, err
 }
