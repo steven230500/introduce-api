@@ -3,8 +3,10 @@ package org
 
 import (
 	"context"
+	"encoding/json"
 	"errors"
 	"net/http"
+	"regexp"
 	"strings"
 	"time"
 
@@ -184,6 +186,44 @@ type Handler struct {
 	auth *auth.Repo
 }
 
+// Palette returns the colours this church has saved.
+func (r *Repo) Palette(ctx context.Context, orgID uuid.UUID) ([]string, error) {
+	var raw []byte
+	err := r.pool.QueryRow(ctx,
+		`select coalesce(palette, '[]'::jsonb) from organizations where id = $1`, orgID).Scan(&raw)
+	if errors.Is(err, pgx.ErrNoRows) {
+		return nil, httpx.ErrNotFound
+	}
+	if err != nil {
+		return nil, err
+	}
+
+	colors := []string{}
+	if err := json.Unmarshal(raw, &colors); err != nil {
+		// A row we cannot read is not worth failing a service over; the church
+		// simply sees the built-in swatches.
+		return []string{}, nil
+	}
+	return colors, nil
+}
+
+// SetPalette replaces the saved colours.
+func (r *Repo) SetPalette(ctx context.Context, orgID uuid.UUID, colors []string) error {
+	encoded, err := json.Marshal(colors)
+	if err != nil {
+		return err
+	}
+	tag, err := r.pool.Exec(ctx,
+		`update organizations set palette = $2 where id = $1`, orgID, encoded)
+	if err != nil {
+		return err
+	}
+	if tag.RowsAffected() == 0 {
+		return httpx.ErrNotFound
+	}
+	return nil
+}
+
 func NewHandler(repo *Repo, authRepo *auth.Repo) *Handler {
 	return &Handler{repo: repo, auth: authRepo}
 }
@@ -198,7 +238,75 @@ func (h *Handler) Router() chi.Router {
 	r.Get("/pending", h.pending)
 	r.Post("/members/{id}/approve", h.approve)
 	r.Post("/members/{id}/reject", h.reject)
+	r.Get("/palette", h.palette)
+	r.Put("/palette", h.setPalette)
 	return r
+}
+
+// hexColor is the only shape a stored colour may take.
+//
+// The designs read these straight into a renderer, so anything else would
+// surface as a blank slide during a service rather than as an error here.
+var hexColor = regexp.MustCompile(`^#[0-9A-Fa-f]{6}$`)
+
+// maxPaletteColors keeps one church from turning the picker into a wall.
+const maxPaletteColors = 24
+
+func (h *Handler) palette(w http.ResponseWriter, r *http.Request) {
+	orgID, ok := auth.OrgID(r.Context())
+	if !ok {
+		httpx.WriteError(w, httpx.ErrForbidden)
+		return
+	}
+	colors, err := h.repo.Palette(r.Context(), orgID)
+	if err != nil {
+		httpx.WriteError(w, err)
+		return
+	}
+	httpx.JSON(w, http.StatusOK, map[string]any{"colors": colors})
+}
+
+func (h *Handler) setPalette(w http.ResponseWriter, r *http.Request) {
+	orgID, ok := auth.OrgID(r.Context())
+	if !ok {
+		httpx.WriteError(w, httpx.ErrForbidden)
+		return
+	}
+
+	var body struct {
+		Colors []string `json:"colors"`
+	}
+	if err := httpx.Decode(r, &body); err != nil {
+		httpx.WriteError(w, err)
+		return
+	}
+	if len(body.Colors) > maxPaletteColors {
+		httpx.WriteError(w, httpx.Fail(http.StatusBadRequest, "too_many_colors",
+			"demasiados colores guardados"))
+		return
+	}
+
+	cleaned := make([]string, 0, len(body.Colors))
+	seen := map[string]bool{}
+	for _, c := range body.Colors {
+		c = strings.ToUpper(strings.TrimSpace(c))
+		if !hexColor.MatchString(c) {
+			httpx.WriteError(w, httpx.Fail(http.StatusBadRequest, "bad_color",
+				"color inválido: "+c))
+			return
+		}
+		if seen[c] {
+			continue
+		}
+		seen[c] = true
+		cleaned = append(cleaned, c)
+	}
+
+	if err := h.repo.SetPalette(r.Context(), orgID, cleaned); err != nil {
+		httpx.WriteError(w, err)
+		return
+	}
+	httpx.JSON(w, http.StatusOK, map[string]any{"colors": cleaned})
 }
 
 func (h *Handler) membership(w http.ResponseWriter, r *http.Request) {
