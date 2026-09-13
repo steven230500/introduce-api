@@ -20,6 +20,7 @@ import (
 	"github.com/steven230500/introduce-api/internal/config"
 	"github.com/steven230500/introduce-api/internal/db"
 	"github.com/steven230500/introduce-api/internal/health"
+	"github.com/steven230500/introduce-api/internal/history"
 	"github.com/steven230500/introduce-api/internal/media"
 	"github.com/steven230500/introduce-api/internal/org"
 	"github.com/steven230500/introduce-api/internal/presentation"
@@ -91,6 +92,7 @@ func main() {
 		r.Mount("/templates", templates.NewHandler(templates.NewRepo(pool)).Router())
 		r.Mount("/collections", collections.NewHandler(collections.NewRepo(pool)).Router())
 		r.Mount("/media", media.NewHandler(store, media.NewRepo(pool)).Router())
+		r.Mount("/history", history.NewHandler(history.NewRepo(pool)).Router())
 	})
 
 	server := &http.Server{
