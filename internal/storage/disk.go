@@ -7,6 +7,10 @@ import (
 	"path/filepath"
 )
 
+// DiskStore keeps uploads on the machine running the API.
+//
+// Right for a self-hosted install and for local development. Wrong for a
+// hosted plan with video in it, which is what [S3Store] is for.
 type DiskStore struct {
 	baseDir string
 	baseURL string
@@ -21,7 +25,9 @@ func NewDisk(baseDir, baseURL string) (*DiskStore, error) {
 	return &DiskStore{baseDir: baseDir, baseURL: baseURL}, nil
 }
 
-func (s *DiskStore) Save(_ context.Context, category, filename string, data []byte) (string, error) {
+func (s *DiskStore) Kind() string { return "disk" }
+
+func (s *DiskStore) Save(_ context.Context, category, filename string, data []byte, _ string) (string, error) {
 	dir := filepath.Join(s.baseDir, category)
 	if err := os.MkdirAll(dir, 0755); err != nil {
 		return "", err
@@ -34,5 +40,9 @@ func (s *DiskStore) Save(_ context.Context, category, filename string, data []by
 }
 
 func (s *DiskStore) Delete(_ context.Context, category, filename string) error {
-	return os.Remove(filepath.Join(s.baseDir, category, filename))
+	err := os.Remove(filepath.Join(s.baseDir, category, filename))
+	if os.IsNotExist(err) {
+		return nil
+	}
+	return err
 }

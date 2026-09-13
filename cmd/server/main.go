@@ -50,10 +50,11 @@ func main() {
 	}
 	log.Println("schema up to date")
 
-	store, err := storage.NewDisk(cfg.UploadsDir, cfg.FilesBaseURL)
+	store, err := newStore(cfg.UploadsDir, cfg.FilesBaseURL)
 	if err != nil {
 		log.Fatalf("storage: %v", err)
 	}
+	log.Printf("uploads go to %s", store.Kind())
 
 	authRepo := auth.NewRepo(pool)
 	tokens := auth.NewTokenIssuer(cfg.JWTSecret, cfg.AccessTTL, cfg.RefreshTTL)
@@ -131,4 +132,16 @@ func corsMiddleware(origin string) func(http.Handler) http.Handler {
 			next.ServeHTTP(w, r)
 		})
 	}
+}
+
+// newStore picks where uploads land.
+//
+// A bucket if one is configured, the machine's own disk otherwise. Failing
+// hard on a half-configured bucket is deliberate: silently falling back to
+// disk would fill the droplet over weeks and only show up when it is full.
+func newStore(uploadsDir, filesBaseURL string) (storage.Store, error) {
+	if cfg := storage.S3FromEnv(); cfg.Configured() {
+		return storage.NewS3(cfg)
+	}
+	return storage.NewDisk(uploadsDir, filesBaseURL)
 }

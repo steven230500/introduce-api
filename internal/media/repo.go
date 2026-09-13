@@ -74,3 +74,20 @@ func (r *Repo) Take(ctx context.Context, orgID, id uuid.UUID) (Item, error) {
 	}
 	return m, err
 }
+
+// Usage is how much room an organization has taken and which plan it is on.
+//
+// One round trip rather than two: this runs on every upload, before the bytes
+// are accepted, and an upload is already the slowest thing the API does.
+func (r *Repo) Usage(ctx context.Context, orgID uuid.UUID) (used int64, planName string, err error) {
+	err = r.pool.QueryRow(ctx, `
+		select coalesce(sum(m.size_bytes), 0)::bigint,
+		       coalesce(max(o.plan), 'free')
+		from organizations o
+		left join media_items m on m.org_id = o.id
+		where o.id = $1`, orgID).Scan(&used, &planName)
+	if errors.Is(err, pgx.ErrNoRows) {
+		return 0, "free", httpx.ErrNotFound
+	}
+	return used, planName, err
+}
