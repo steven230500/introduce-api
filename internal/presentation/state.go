@@ -4,6 +4,7 @@ package presentation
 
 import (
 	"context"
+	"encoding/json"
 	"errors"
 	"time"
 
@@ -26,8 +27,15 @@ type State struct {
 
 	// StageMessage reaches the stage monitor and nothing else, so the platform
 	// can be told something the congregation is not.
-	StageMessage *string   `json:"stage_message"`
-	UpdatedAt    time.Time `json:"updated_at"`
+	StageMessage *string `json:"stage_message"`
+
+	// Waiting is the scene shown while nothing is on the screen: which one,
+	// whether it is up, and the text over it. Carried as the client sent it,
+	// because the server has no opinion about scenes and a new setting on one
+	// should not need a server release to reach the projector.
+	Waiting json.RawMessage `json:"waiting,omitempty"`
+
+	UpdatedAt time.Time `json:"updated_at"`
 }
 
 type Repo struct{ pool *pgxpool.Pool }
@@ -42,11 +50,11 @@ func (r *Repo) Get(ctx context.Context, userID uuid.UUID) (State, error) {
 	err := r.pool.QueryRow(ctx, `
 		select collection_id, current_item_index, current_slide_index, is_live,
 		       blank_screen, countdown_active, countdown_end, overlay_visible,
-		       overlay_text, stage_message, updated_at
+		       overlay_text, stage_message, waiting, updated_at
 		from presentation_state where user_id = $1`, userID,
 	).Scan(&s.CollectionID, &s.CurrentItemIndex, &s.CurrentSlideIndex, &s.IsLive,
 		&s.BlankScreen, &s.CountdownActive, &s.CountdownEnd, &s.OverlayVisible,
-		&s.OverlayText, &s.StageMessage, &s.UpdatedAt)
+		&s.OverlayText, &s.StageMessage, &s.Waiting, &s.UpdatedAt)
 	if errors.Is(err, pgx.ErrNoRows) {
 		return State{UpdatedAt: time.Now()}, nil
 	}
@@ -58,8 +66,8 @@ func (r *Repo) Upsert(ctx context.Context, userID uuid.UUID, s State) (State, er
 		insert into presentation_state (
 			user_id, collection_id, current_item_index, current_slide_index,
 			is_live, blank_screen, countdown_active, countdown_end,
-			overlay_visible, overlay_text, stage_message
-		) values ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11)
+			overlay_visible, overlay_text, stage_message, waiting
+		) values ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12)
 		on conflict (user_id) do update set
 			collection_id       = excluded.collection_id,
 			current_item_index  = excluded.current_item_index,
@@ -70,11 +78,21 @@ func (r *Repo) Upsert(ctx context.Context, userID uuid.UUID, s State) (State, er
 			countdown_end       = excluded.countdown_end,
 			overlay_visible     = excluded.overlay_visible,
 			overlay_text        = excluded.overlay_text,
-			stage_message       = excluded.stage_message
+			stage_message       = excluded.stage_message,
+			waiting             = excluded.waiting
 		returning updated_at`,
 		userID, s.CollectionID, s.CurrentItemIndex, s.CurrentSlideIndex,
 		s.IsLive, s.BlankScreen, s.CountdownActive, s.CountdownEnd,
-		s.OverlayVisible, s.OverlayText, s.StageMessage,
+		s.OverlayVisible, s.OverlayText, s.StageMessage, nullableJSON(s.Waiting),
 	).Scan(&s.UpdatedAt)
 	return s, err
+}
+
+// nullableJSON stores an absent waiting screen as SQL null rather than the
+// literal JSON null, so "never set" and "set to nothing" read the same.
+func nullableJSON(raw json.RawMessage) any {
+	if len(raw) == 0 || string(raw) == "null" {
+		return nil
+	}
+	return []byte(raw)
 }
