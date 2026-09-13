@@ -31,12 +31,18 @@ type Verse struct {
 }
 
 type Song struct {
-	ID       uuid.UUID `json:"id"`
-	Title    string    `json:"title"`
-	Author   *string   `json:"author"`
-	Language string    `json:"language"`
-	Tags     []string  `json:"tags"`
-	Verses   []Verse   `json:"verses"`
+	ID     uuid.UUID `json:"id"`
+	Title  string    `json:"title"`
+	Author *string   `json:"author"`
+	// Copyright and licence number travel with the song inside a service, not
+	// only from /songs: they are what the projection record copies at the
+	// moment a song goes on screen, and a licence report without them is a
+	// list of titles nobody can file.
+	Copyright  *string  `json:"copyright"`
+	CCLINumber *string  `json:"ccli_number"`
+	Language   string   `json:"language"`
+	Tags       []string `json:"tags"`
+	Verses     []Verse  `json:"verses"`
 }
 
 type Item struct {
@@ -114,7 +120,7 @@ func (r *Repo) List(ctx context.Context, orgID uuid.UUID) ([]Collection, error) 
 	itemRows, err := r.pool.Query(ctx, `
 		select i.id, i.collection_id, i.item_type, i.item_order, i.template_id,
 		       i.content_json, i.notes, i.auto_advance_secs,
-		       s.id, s.title, s.author, s.language, s.tags
+		       s.id, s.title, s.author, s.copyright, s.ccli_number, s.language, s.tags
 		from collection_items i
 		left join songs s on s.id = i.song_id
 		where i.collection_id = any($1)
@@ -128,21 +134,23 @@ func (r *Repo) List(ctx context.Context, orgID uuid.UUID) ([]Collection, error) 
 	for itemRows.Next() {
 		var it Item
 		var songID *uuid.UUID
-		var title, author, language *string
+		var title, author, copyright, ccli, language *string
 		var tags []string
 		if err := itemRows.Scan(&it.ID, &it.CollectionID, &it.ItemType, &it.ItemOrder,
 			&it.TemplateID, &it.ContentJSON, &it.Notes, &it.AutoAdvanceSecs,
-			&songID, &title, &author, &language, &tags); err != nil {
+			&songID, &title, &author, &copyright, &ccli, &language, &tags); err != nil {
 			return nil, err
 		}
 		if songID != nil {
 			it.Song = &Song{
-				ID:       *songID,
-				Title:    deref(title),
-				Author:   author,
-				Language: deref(language),
-				Tags:     tags,
-				Verses:   []Verse{},
+				ID:         *songID,
+				Title:      deref(title),
+				Author:     author,
+				Copyright:  copyright,
+				CCLINumber: ccli,
+				Language:   deref(language),
+				Tags:       tags,
+				Verses:     []Verse{},
 			}
 		}
 		ci, ok := index[it.CollectionID]
