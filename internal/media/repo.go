@@ -13,7 +13,7 @@ import (
 
 // Item is one file in an organization's media library.
 //
-// The bytes live on this server's disk; this row is the index the app browses.
+// The bytes live in the configured store; this row is the index the app browses.
 type Item struct {
 	ID          uuid.UUID `json:"id"`
 	Name        string    `json:"name"`
@@ -22,16 +22,49 @@ type Item struct {
 	MediaType   string    `json:"media_type"`
 	SizeBytes   *int64    `json:"size_bytes"`
 	CreatedAt   time.Time `json:"created_at"`
+
+	// Role is RoleLibrary for a file put on the screen by itself, and
+	// RoleBackground for one that sits behind the text of a design.
+	Role string `json:"role"`
+
+	// Width, Height and DurationMs are recorded for backgrounds, which are
+	// checked against them. DurationMs is nil for a still.
+	Width      *int `json:"width,omitempty"`
+	Height     *int `json:"height,omitempty"`
+	DurationMs *int `json:"duration_ms,omitempty"`
+
+	// PosterURL is a still frame of a video background. PosterPath is where it
+	// is stored, which only the server needs.
+	PosterURL  *string `json:"poster_url,omitempty"`
+	PosterPath *string `json:"-"`
 }
+
+const (
+	RoleLibrary    = "library"
+	RoleBackground = "background"
+)
 
 type Repo struct{ pool *pgxpool.Pool }
 
 func NewRepo(pool *pgxpool.Pool) *Repo { return &Repo{pool: pool} }
 
-func (r *Repo) List(ctx context.Context, orgID uuid.UUID) ([]Item, error) {
+const itemColumns = `id, name, url, storage_path, media_type, size_bytes, created_at,
+	role, width, height, duration_ms, poster_url, poster_path`
+
+type scanner interface{ Scan(dest ...any) error }
+
+func scanItem(row scanner) (Item, error) {
+	var m Item
+	err := row.Scan(&m.ID, &m.Name, &m.URL, &m.StoragePath, &m.MediaType, &m.SizeBytes,
+		&m.CreatedAt, &m.Role, &m.Width, &m.Height, &m.DurationMs, &m.PosterURL, &m.PosterPath)
+	return m, err
+}
+
+// List returns the files with one role, newest first.
+func (r *Repo) List(ctx context.Context, orgID uuid.UUID, role string) ([]Item, error) {
 	rows, err := r.pool.Query(ctx, `
-		select id, name, url, storage_path, media_type, size_bytes, created_at
-		from media_items where org_id = $1 order by created_at desc`, orgID)
+		select `+itemColumns+`
+		from media_items where org_id = $1 and role = $2 order by created_at desc`, orgID, role)
 	if err != nil {
 		return nil, err
 	}
@@ -39,9 +72,8 @@ func (r *Repo) List(ctx context.Context, orgID uuid.UUID) ([]Item, error) {
 
 	out := []Item{}
 	for rows.Next() {
-		var m Item
-		if err := rows.Scan(&m.ID, &m.Name, &m.URL, &m.StoragePath,
-			&m.MediaType, &m.SizeBytes, &m.CreatedAt); err != nil {
+		m, err := scanItem(rows)
+		if err != nil {
 			return nil, err
 		}
 		out = append(out, m)
@@ -50,25 +82,29 @@ func (r *Repo) List(ctx context.Context, orgID uuid.UUID) ([]Item, error) {
 }
 
 func (r *Repo) Create(ctx context.Context, orgID, userID uuid.UUID, m Item) (Item, error) {
-	err := r.pool.QueryRow(ctx, `
-		insert into media_items (org_id, created_by, name, url, storage_path, media_type, size_bytes)
-		values ($1, $2, $3, $4, $5, $6, $7)
-		returning id, name, url, storage_path, media_type, size_bytes, created_at`,
+	if m.Role == "" {
+		m.Role = RoleLibrary
+	}
+	return scanItem(r.pool.QueryRow(ctx, `
+		insert into media_items (org_id, created_by, name, url, storage_path, media_type, size_bytes,
+		                         role, width, height, duration_ms, poster_url, poster_path)
+		values ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13)
+		returning `+itemColumns,
 		orgID, userID, m.Name, m.URL, m.StoragePath, m.MediaType, m.SizeBytes,
-	).Scan(&m.ID, &m.Name, &m.URL, &m.StoragePath, &m.MediaType, &m.SizeBytes, &m.CreatedAt)
-	return m, err
+		m.Role, m.Width, m.Height, m.DurationMs, m.PosterURL, m.PosterPath,
+	))
 }
 
-// Take removes the row and returns it, so the caller knows which file on disk
-// to delete. Row first, then bytes: a row pointing at a missing file shows as a
-// broken thumbnail, while a file with no row is invisible and never freed.
+// Take removes the row and returns it, so the caller knows which files in the
+// store to delete. Row first, then bytes: a row pointing at a missing file
+// shows as a broken thumbnail, while a file with no row is invisible and never
+// freed.
 func (r *Repo) Take(ctx context.Context, orgID, id uuid.UUID) (Item, error) {
-	var m Item
-	err := r.pool.QueryRow(ctx, `
+	m, err := scanItem(r.pool.QueryRow(ctx, `
 		delete from media_items where id = $1 and org_id = $2
-		returning id, name, url, storage_path, media_type, size_bytes, created_at`,
+		returning `+itemColumns,
 		id, orgID,
-	).Scan(&m.ID, &m.Name, &m.URL, &m.StoragePath, &m.MediaType, &m.SizeBytes, &m.CreatedAt)
+	))
 	if errors.Is(err, pgx.ErrNoRows) {
 		return Item{}, httpx.ErrNotFound
 	}

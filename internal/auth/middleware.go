@@ -95,3 +95,11 @@ func bearerToken(r *http.Request) string {
 	}
 	return strings.TrimSpace(parts[1])
 }
+
+// WithIdentity puts a caller on a context the way [Service.Middleware] does,
+// for code that already knows who is asking - a test driving a handler
+// directly, without minting a token first.
+func WithIdentity(ctx context.Context, userID, orgID uuid.UUID) context.Context {
+	ctx = context.WithValue(ctx, userIDKey, userID)
+	return context.WithValue(ctx, orgIDKey, orgID)
+}

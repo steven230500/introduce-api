@@ -1,12 +1,16 @@
 package media
 
 import (
+	"bytes"
 	"encoding/json"
 	"fmt"
+	"image"
 	"io"
 	"net/http"
 	"path/filepath"
+	"strconv"
 	"strings"
+	"time"
 
 	"github.com/go-chi/chi/v5"
 	"github.com/google/uuid"
@@ -34,6 +38,7 @@ func (h *Handler) Router() http.Handler {
 	r := chi.NewRouter()
 	r.Get("/", h.list)
 	r.Get("/usage", h.usage)
+	r.Get("/backgrounds", h.backgrounds)
 	r.Post("/upload", h.upload)
 	r.Delete("/item/{id}", h.deleteItem)
 	r.Delete("/{category}/{filename}", h.delete)
@@ -66,15 +71,9 @@ func (h *Handler) usage(w http.ResponseWriter, r *http.Request) {
 	})
 }
 
-type uploadResponse struct {
-	URL      string `json:"url"`
-	Filename string `json:"filename"`
-	Category string `json:"category"`
-	SizeKB   int    `json:"size_kb"`
-}
-
 func (h *Handler) upload(w http.ResponseWriter, r *http.Request) {
-	if _, ok := auth.UserID(r.Context()); !ok {
+	userID, ok := auth.UserID(r.Context())
+	if !ok {
 		http.Error(w, "unauthorized", http.StatusUnauthorized)
 		return
 	}
@@ -110,9 +109,16 @@ func (h *Handler) upload(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	if used+header.Size > limits.Storage {
-		httpx.WriteError(w, httpx.Fail(http.StatusInsufficientStorage, "storage_full",
-			fmt.Sprintf("El plan %s tiene %s y ya hay %s usados. Borra algo de la biblioteca o pasa a un plan más grande.",
-				limits.Label, plan.Human(limits.Storage), plan.Human(used))))
+		httpx.WriteError(w, storageFull(limits, used))
+		return
+	}
+
+	role := r.FormValue("role")
+	if role == "" {
+		role = RoleLibrary
+	}
+	if role != RoleLibrary && role != RoleBackground {
+		httpx.WriteError(w, httpx.Fail(http.StatusBadRequest, "bad_role", "role inválido"))
 		return
 	}
 
@@ -130,34 +136,69 @@ func (h *Handler) upload(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	var (
-		data     []byte
-		ext      string
-		category string
-	)
+	item := Item{Name: displayName(header.Filename), Role: role}
+	category := categoryFor(ct)
 
-	switch {
-	case isImage(ct):
-		category = "images"
+	if role == RoleBackground {
+		// A background's kind comes from its extension, which the standard
+		// names, rather than from a content type the client library guessed.
+		kind := backgroundKind(header.Filename)
+		candidate := Candidate{Filename: header.Filename, Bytes: header.Size}
+		switch kind {
+		case "image":
+			category = "images"
+			// The header of the image, not the whole picture: enough to know
+			// its size without decoding forty megapixels to find out.
+			if cfg, _, err := image.DecodeConfig(bytes.NewReader(buf)); err == nil {
+				candidate.Width, candidate.Height = cfg.Width, cfg.Height
+			}
+		case "video":
+			category = "videos"
+			// The server has no video decoder, so the app says how large and
+			// how long the loop is. It has already checked the file itself;
+			// this keeps a client that did not from filing nonsense.
+			candidate.Width = formInt(r, "width")
+			candidate.Height = formInt(r, "height")
+			candidate.Duration = time.Duration(formInt(r, "duration_ms")) * time.Millisecond
+		}
+		if problems := CheckBackground(candidate); len(problems) > 0 {
+			httpx.WriteError(w, httpx.Fail(http.StatusUnprocessableEntity, "background_standard",
+				strings.Join(problems, " ")))
+			return
+		}
+		item.Width, item.Height = &candidate.Width, &candidate.Height
+		if kind == "video" {
+			ms := int(candidate.Duration / time.Millisecond)
+			item.DurationMs = &ms
+		}
+	}
+
+	var (
+		data []byte
+		ext  string
+	)
+	switch category {
+	case "images":
 		compressed, compExt, err := compress(buf, ct)
 		if err != nil {
 			http.Error(w, fmt.Sprintf("compress: %v", err), http.StatusBadRequest)
 			return
 		}
-		data = compressed
-		ext = compExt
-
-	case isAudio(ct):
-		category = "audio"
+		data, ext = compressed, compExt
+		if role == RoleBackground {
+			// Scaling down on upload changed the size that was checked; the
+			// row records what is actually stored.
+			if cfg, _, err := image.DecodeConfig(bytes.NewReader(data)); err == nil {
+				item.Width, item.Height = &cfg.Width, &cfg.Height
+			}
+		}
+	case "audio":
 		data = buf
 		ext = filepath.Ext(header.Filename)
 		if ext == "" {
 			ext = ".mp3"
 		}
-
 	default:
-		// video or other — store as-is
-		category = "videos"
 		data = buf
 		ext = filepath.Ext(header.Filename)
 		if ext == "" {
@@ -171,33 +212,86 @@ func (h *Handler) upload(w http.ResponseWriter, r *http.Request) {
 		http.Error(w, "storage error", http.StatusInternalServerError)
 		return
 	}
+	size := int64(len(data))
+
+	// A still frame of a video background, sent alongside it. Optional: a
+	// background without one shows its colour where a thumbnail would be,
+	// which is worse but not broken, and not worth refusing the loop over.
+	if role == RoleBackground && category == "videos" {
+		if posterURL, posterPath, posterSize, ok := h.savePoster(r); ok {
+			item.PosterURL, item.PosterPath = &posterURL, &posterPath
+			size += posterSize
+		}
+	}
 
 	// Index the file so the library can list it. The upload already succeeded,
 	// so a failure here loses the row but not the bytes, and the client is told.
-	userID, _ := auth.UserID(r.Context())
-	size := int64(len(data))
-	mediaType := "image"
+	item.URL = url
+	item.StoragePath = category + "/" + filename
+	item.MediaType = "image"
 	if category == "videos" {
-		mediaType = "video"
+		item.MediaType = "video"
 	}
+	item.SizeBytes = &size
 
-	item, err := h.repo.Create(r.Context(), orgID, userID, Item{
-		Name:        displayName(header.Filename),
-		URL:         url,
-		StoragePath: category + "/" + filename,
-		MediaType:   mediaType,
-		SizeBytes:   &size,
-	})
+	created, err := h.repo.Create(r.Context(), orgID, userID, item)
 	if err != nil {
 		httpx.WriteError(w, err)
 		return
 	}
 
-	httpx.JSON(w, http.StatusCreated, item)
+	httpx.JSON(w, http.StatusCreated, created)
+}
+
+// savePoster stores the "poster" part of the form, if there is one and it is a
+// picture.
+func (h *Handler) savePoster(r *http.Request) (url, path string, size int64, ok bool) {
+	part, header, err := r.FormFile("poster")
+	if err != nil {
+		return "", "", 0, false
+	}
+	defer part.Close()
+	raw, err := io.ReadAll(part)
+	if err != nil {
+		return "", "", 0, false
+	}
+	data, ext, err := compress(raw, header.Header.Get("Content-Type"))
+	if err != nil {
+		return "", "", 0, false
+	}
+	filename := uuid.New().String() + ext
+	url, err = h.store.Save(r.Context(), "images", filename, data, storedType("images", "", ext))
+	if err != nil {
+		return "", "", 0, false
+	}
+	return url, "images/" + filename, int64(len(data)), true
+}
+
+func storageFull(limits plan.Limits, used int64) error {
+	return httpx.Fail(http.StatusInsufficientStorage, "storage_full",
+		fmt.Sprintf("El plan %s tiene %s y ya hay %s usados. Borra algo de la biblioteca o pasa a un plan más grande.",
+			limits.Label, plan.Human(limits.Storage), plan.Human(used)))
+}
+
+func formInt(r *http.Request, key string) int {
+	n, err := strconv.Atoi(strings.TrimSpace(r.FormValue(key)))
+	if err != nil {
+		return 0
+	}
+	return n
 }
 
 func (h *Handler) list(w http.ResponseWriter, r *http.Request) {
-	out, err := h.repo.List(r.Context(), auth.MustOrgID(r.Context()))
+	h.listRole(w, r, RoleLibrary)
+}
+
+// backgrounds lists what a church has added to put behind its designs.
+func (h *Handler) backgrounds(w http.ResponseWriter, r *http.Request) {
+	h.listRole(w, r, RoleBackground)
+}
+
+func (h *Handler) listRole(w http.ResponseWriter, r *http.Request, role string) {
+	out, err := h.repo.List(r.Context(), auth.MustOrgID(r.Context()), role)
 	if err != nil {
 		httpx.WriteError(w, err)
 		return
@@ -205,7 +299,7 @@ func (h *Handler) list(w http.ResponseWriter, r *http.Request) {
 	httpx.JSON(w, http.StatusOK, out)
 }
 
-// deleteItem removes the library entry and the file behind it.
+// deleteItem removes the library entry and the files behind it.
 func (h *Handler) deleteItem(w http.ResponseWriter, r *http.Request) {
 	id, err := uuid.Parse(chi.URLParam(r, "id"))
 	if err != nil {
@@ -219,13 +313,36 @@ func (h *Handler) deleteItem(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	parts := strings.SplitN(item.StoragePath, "/", 2)
-	if len(parts) == 2 {
-		// A missing file is not an error worth failing the request over: the
-		// row is already gone and the library is consistent.
-		_ = h.store.Delete(r.Context(), parts[0], parts[1])
+	// A missing file is not an error worth failing the request over: the row
+	// is already gone and the library is consistent.
+	for _, stored := range []*string{&item.StoragePath, item.PosterPath} {
+		if stored == nil {
+			continue
+		}
+		if parts := strings.SplitN(*stored, "/", 2); len(parts) == 2 {
+			_ = h.store.Delete(r.Context(), parts[0], parts[1])
+		}
 	}
 	httpx.NoContent(w)
+}
+
+// categoryFor files an upload by the content type it arrived with.
+//
+// Video is asked about before audio, and audio by its prefix: "video/mp4"
+// contains "mp4", and a check for that alone filed every MP4 as audio.
+func categoryFor(contentType string) string {
+	ct := strings.ToLower(contentType)
+	switch {
+	case isImage(ct):
+		return "images"
+	case strings.HasPrefix(ct, "video/"):
+		return "videos"
+	case isAudio(ct):
+		return "audio"
+	default:
+		// Video or anything else is stored as-is.
+		return "videos"
+	}
 }
 
 // storedType is the content type the file is served back with. Compression may

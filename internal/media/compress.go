@@ -6,6 +6,9 @@ import (
 	"image"
 	"image/jpeg"
 	"image/png"
+	// Registers WebP with image.Decode and image.DecodeConfig. Photos saved
+	// from a browser are WebP more often than not.
+	_ "golang.org/x/image/webp"
 	"strings"
 
 	"github.com/nfnt/resize"
@@ -61,9 +64,11 @@ func isImage(contentType string) bool {
 
 func isAudio(contentType string) bool {
 	ct := strings.ToLower(contentType)
-	return strings.Contains(ct, "audio/") ||
+	if strings.HasPrefix(ct, "video/") {
+		return false
+	}
+	return strings.HasPrefix(ct, "audio/") ||
 		strings.Contains(ct, "mpeg") ||
-		strings.Contains(ct, "mp4") ||
 		strings.Contains(ct, "m4a") ||
 		strings.Contains(ct, "ogg") ||
 		strings.Contains(ct, "flac")
