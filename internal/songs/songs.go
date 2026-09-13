@@ -3,7 +3,9 @@ package songs
 
 import (
 	"context"
+	"encoding/json"
 	"errors"
+	"fmt"
 	"net/http"
 	"strings"
 	"time"
@@ -166,6 +168,44 @@ func (r *Repo) Save(ctx context.Context, orgID, userID uuid.UUID, id *uuid.UUID,
 	}
 	defer func() { _ = tx.Rollback(ctx) }()
 
+	songID, err := saveTx(ctx, tx, orgID, userID, id, in)
+	if err != nil {
+		return Song{}, err
+	}
+	if err := tx.Commit(ctx); err != nil {
+		return Song{}, err
+	}
+	return r.Get(ctx, orgID, songID)
+}
+
+// Import creates every song in one transaction and returns their ids in the
+// order they were given.
+//
+// All or nothing: a church bringing its library over from another program
+// that ends up with half of it, and no way to tell which half, has to check
+// every song by hand. Failing whole means trying again is safe.
+func (r *Repo) Import(ctx context.Context, orgID, userID uuid.UUID, songs []Input) ([]uuid.UUID, error) {
+	tx, err := r.pool.Begin(ctx)
+	if err != nil {
+		return nil, err
+	}
+	defer func() { _ = tx.Rollback(ctx) }()
+
+	ids := make([]uuid.UUID, 0, len(songs))
+	for _, in := range songs {
+		id, err := saveTx(ctx, tx, orgID, userID, nil, in)
+		if err != nil {
+			return nil, err
+		}
+		ids = append(ids, id)
+	}
+	if err := tx.Commit(ctx); err != nil {
+		return nil, err
+	}
+	return ids, nil
+}
+
+func saveTx(ctx context.Context, tx pgx.Tx, orgID, userID uuid.UUID, id *uuid.UUID, in Input) (uuid.UUID, error) {
 	language := in.Language
 	if language == "" {
 		language = "es"
@@ -176,6 +216,7 @@ func (r *Repo) Save(ctx context.Context, orgID, userID uuid.UUID, id *uuid.UUID,
 	}
 
 	var songID uuid.UUID
+	var err error
 	if id == nil {
 		err = tx.QueryRow(ctx, `
 			insert into songs (org_id, created_by, title, author, copyright, ccli_number, language, tags)
@@ -192,34 +233,33 @@ func (r *Repo) Save(ctx context.Context, orgID, userID uuid.UUID, id *uuid.UUID,
 			*id, orgID, in.Title, in.Author, in.Copyright, in.CCLINumber, language, tags,
 		).Scan(&songID)
 		if errors.Is(err, pgx.ErrNoRows) {
-			return Song{}, httpx.ErrNotFound
+			return uuid.Nil, httpx.ErrNotFound
 		}
 	}
 	if err != nil {
-		return Song{}, err
+		return uuid.Nil, err
 	}
 
 	if _, err := tx.Exec(ctx, `delete from verses where song_id = $1`, songID); err != nil {
-		return Song{}, err
+		return uuid.Nil, err
 	}
+	batch := &pgx.Batch{}
 	for i, v := range in.Verses {
 		order := v.VerseOrder
 		if order == 0 {
 			order = i
 		}
-		if _, err := tx.Exec(ctx, `
+		batch.Queue(`
 			insert into verses (song_id, type, verse_order, content, chords)
 			values ($1, $2, $3, $4, $5)`,
-			songID, v.Type, order, v.Content, v.Chords,
-		); err != nil {
-			return Song{}, err
+			songID, v.Type, order, v.Content, v.Chords)
+	}
+	if batch.Len() > 0 {
+		if err := tx.SendBatch(ctx, batch).Close(); err != nil {
+			return uuid.Nil, err
 		}
 	}
-
-	if err := tx.Commit(ctx); err != nil {
-		return Song{}, err
-	}
-	return r.Get(ctx, orgID, songID)
+	return songID, nil
 }
 
 func (r *Repo) Delete(ctx context.Context, orgID, id uuid.UUID) error {
@@ -243,6 +283,7 @@ func (h *Handler) Router() chi.Router {
 	r := chi.NewRouter()
 	r.Get("/", h.list)
 	r.Post("/", h.create)
+	r.Post("/import", h.importSongs)
 	r.Get("/{id}", h.get)
 	r.Put("/{id}", h.update)
 	r.Delete("/{id}", h.delete)
@@ -322,6 +363,69 @@ func (h *Handler) delete(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	httpx.NoContent(w)
+}
+
+// The most songs one import request may carry. The app sends a large library
+// in several requests of this size, so each one commits quickly and a dropped
+// connection costs one chunk, not the whole library.
+const maxImport = 200
+
+// importBody is larger than a single song's limit: two hundred songs with
+// their verses run to a few megabytes.
+const maxImportBytes = 8 << 20
+
+var verseTypes = map[string]bool{
+	"verse": true, "chorus": true, "bridge": true, "pre-chorus": true,
+	"tag": true, "intro": true, "outro": true,
+}
+
+type importResponse struct {
+	IDs []uuid.UUID `json:"ids"`
+}
+
+// importSongs adds songs brought over from another program.
+func (h *Handler) importSongs(w http.ResponseWriter, r *http.Request) {
+	var body struct {
+		Songs []Input `json:"songs"`
+	}
+	dec := json.NewDecoder(http.MaxBytesReader(w, r.Body, maxImportBytes))
+	dec.DisallowUnknownFields()
+	if err := dec.Decode(&body); err != nil {
+		httpx.WriteError(w, httpx.Fail(http.StatusBadRequest, "bad_request", "cuerpo inválido: "+err.Error()))
+		return
+	}
+	if len(body.Songs) == 0 {
+		httpx.JSON(w, http.StatusOK, importResponse{IDs: []uuid.UUID{}})
+		return
+	}
+	if len(body.Songs) > maxImport {
+		httpx.WriteError(w, httpx.Fail(http.StatusRequestEntityTooLarge, "too_many_songs",
+			fmt.Sprintf("se pueden importar hasta %d canciones por pedido", maxImport)))
+		return
+	}
+	for i := range body.Songs {
+		song := &body.Songs[i]
+		song.Title = strings.TrimSpace(song.Title)
+		if song.Title == "" {
+			httpx.WriteError(w, httpx.Fail(http.StatusBadRequest, "invalid_title",
+				fmt.Sprintf("la canción %d no tiene título", i+1)))
+			return
+		}
+		// A section name this library does not know becomes a verse rather
+		// than failing the whole import on a check constraint.
+		for j := range song.Verses {
+			if !verseTypes[song.Verses[j].Type] {
+				song.Verses[j].Type = "verse"
+			}
+		}
+	}
+	userID, _ := auth.UserID(r.Context())
+	ids, err := h.repo.Import(r.Context(), auth.MustOrgID(r.Context()), userID, body.Songs)
+	if err != nil {
+		httpx.WriteError(w, err)
+		return
+	}
+	httpx.JSON(w, http.StatusCreated, importResponse{IDs: ids})
 }
 
 func parseID(r *http.Request) (uuid.UUID, error) {
