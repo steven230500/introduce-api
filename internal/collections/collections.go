@@ -4,6 +4,7 @@ package collections
 import (
 	"context"
 	"encoding/json"
+	"errors"
 	"net/http"
 	"strconv"
 	"strings"
@@ -11,6 +12,7 @@ import (
 
 	"github.com/go-chi/chi/v5"
 	"github.com/google/uuid"
+	"github.com/jackc/pgx/v5"
 	"github.com/jackc/pgx/v5/pgxpool"
 	"github.com/steven230500/introduce-api/internal/auth"
 	"github.com/steven230500/introduce-api/internal/httpx"
@@ -201,31 +203,56 @@ func (r *Repo) List(ctx context.Context, orgID uuid.UUID) ([]Collection, error) 
 }
 
 type CollectionInput struct {
-	Name        string  `json:"name"`
-	ServiceDate *string `json:"service_date"`
-	Notes       *string `json:"notes"`
-	TemplateID  *string `json:"template_id"`
-	BgAudioPath *string `json:"bg_audio_path"`
+	// ID is chosen by the client when it made the service with no network.
+	// Everything it queued afterwards - the items, a rename - already points
+	// at that id, so the server has to keep it rather than hand out its own.
+	ID          *uuid.UUID `json:"id"`
+	Name        string     `json:"name"`
+	ServiceDate *string    `json:"service_date"`
+	Notes       *string    `json:"notes"`
+	TemplateID  *string    `json:"template_id"`
+	BgAudioPath *string    `json:"bg_audio_path"`
 }
 
-func (r *Repo) Create(ctx context.Context, orgID, userID uuid.UUID, in CollectionInput) (Collection, error) {
+// ErrIDTaken is a client-chosen id that already names another church's row.
+var ErrIDTaken = httpx.Fail(http.StatusConflict, "id_taken", "ese id ya está en uso")
+
+// Create stores a new collection and reports whether this call made it.
+//
+// Sending the same id twice is not an error: a queue replayed after the
+// response to the first attempt was lost would otherwise fail on its own
+// success, and drop everything queued behind it.
+func (r *Repo) Create(ctx context.Context, orgID, userID uuid.UUID, in CollectionInput) (Collection, bool, error) {
 	var c Collection
 	var serviceDate *time.Time
 	err := r.pool.QueryRow(ctx, `
-		insert into collections (org_id, created_by, name, service_date, notes)
-		values ($1, $2, $3, $4, $5)
+		insert into collections (id, org_id, created_by, name, service_date, notes)
+		values (coalesce($1, gen_random_uuid()), $2, $3, $4, $5, $6)
+		on conflict (id) do nothing
 		returning id, name, service_date, notes, template_id, bg_audio_path, created_at`,
-		orgID, userID, in.Name, parseDate(in.ServiceDate), in.Notes,
+		in.ID, orgID, userID, in.Name, parseDate(in.ServiceDate), in.Notes,
 	).Scan(&c.ID, &c.Name, &serviceDate, &c.Notes, &c.TemplateID, &c.BgAudioPath, &c.CreatedAt)
+	created := true
+	if errors.Is(err, pgx.ErrNoRows) && in.ID != nil {
+		created = false
+		err = r.pool.QueryRow(ctx, `
+			select id, name, service_date, notes, template_id, bg_audio_path, created_at
+			from collections where id = $1 and org_id = $2`,
+			*in.ID, orgID,
+		).Scan(&c.ID, &c.Name, &serviceDate, &c.Notes, &c.TemplateID, &c.BgAudioPath, &c.CreatedAt)
+		if errors.Is(err, pgx.ErrNoRows) {
+			return Collection{}, false, ErrIDTaken
+		}
+	}
 	if err != nil {
-		return Collection{}, err
+		return Collection{}, false, err
 	}
 	c.Items = []Item{}
 	if serviceDate != nil {
 		f := serviceDate.Format("2006-01-02")
 		c.ServiceDate = &f
 	}
-	return c, nil
+	return c, created, nil
 }
 
 // Update applies only the fields present in the request.
@@ -284,6 +311,9 @@ func (r *Repo) Delete(ctx context.Context, orgID, id uuid.UUID) error {
 }
 
 type ItemInput struct {
+	// ID is set by a client that added the item with no network, for the same
+	// reason as CollectionInput.ID.
+	ID              *uuid.UUID      `json:"id"`
 	ItemType        string          `json:"item_type"`
 	SongID          *uuid.UUID      `json:"song_id"`
 	TemplateID      *string         `json:"template_id"`
@@ -294,6 +324,10 @@ type ItemInput struct {
 }
 
 // AddItems appends items to a collection, continuing the existing order.
+//
+// An item whose id is already stored is skipped, not refused and not
+// overwritten: it is the same add arriving a second time, and anything
+// changed on it since came through its own request.
 func (r *Repo) AddItems(ctx context.Context, orgID, collectionID uuid.UUID, inputs []ItemInput) error {
 	if err := r.assertOwned(ctx, orgID, collectionID); err != nil {
 		return err
@@ -321,17 +355,22 @@ func (r *Repo) AddItems(ctx context.Context, orgID, collectionID uuid.UUID, inpu
 		if len(in.ContentJSON) > 0 {
 			content = []byte(in.ContentJSON)
 		}
-		if _, err := tx.Exec(ctx, `
+		tag, err := tx.Exec(ctx, `
 			insert into collection_items
-			    (collection_id, song_id, template_id, item_order, item_type,
+			    (id, collection_id, song_id, template_id, item_order, item_type,
 			     content_json, notes, auto_advance_secs, planned_secs)
-			values ($1, $2, $3, $4, $5, $6, $7, $8, $9)`,
-			collectionID, in.SongID, in.TemplateID, next, itemType,
+			values (coalesce($1, gen_random_uuid()), $2, $3, $4, $5, $6, $7, $8, $9, $10)
+			on conflict (id) do nothing`,
+			in.ID, collectionID, in.SongID, in.TemplateID, next, itemType,
 			content, in.Notes, in.AutoAdvanceSecs, plannedOrNil(in.PlannedSecs),
-		); err != nil {
+		)
+		if err != nil {
 			return err
 		}
-		next++
+		// A skipped repeat takes no place in the running order.
+		if tag.RowsAffected() > 0 {
+			next++
+		}
 	}
 
 	return tx.Commit(ctx)
@@ -536,12 +575,16 @@ func (h *Handler) create(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	userID, _ := auth.UserID(r.Context())
-	out, err := h.repo.Create(r.Context(), auth.MustOrgID(r.Context()), userID, in)
+	out, created, err := h.repo.Create(r.Context(), auth.MustOrgID(r.Context()), userID, in)
 	if err != nil {
 		httpx.WriteError(w, err)
 		return
 	}
-	httpx.JSON(w, http.StatusCreated, out)
+	status := http.StatusCreated
+	if !created {
+		status = http.StatusOK
+	}
+	httpx.JSON(w, status, out)
 }
 
 func (h *Handler) update(w http.ResponseWriter, r *http.Request) {
