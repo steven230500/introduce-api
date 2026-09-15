@@ -148,12 +148,15 @@ func (r *Repo) Members(ctx context.Context, orgID uuid.UUID, status string) ([]M
 
 // SetStatus approves or rejects a pending member, but only for an admin of the
 // same organization. The org_id and role checks are in the statement itself, so
-// there is no window between checking and writing.
+// there is no window between checking and writing. Only a pending request can
+// be answered: removing someone already in is RemoveMember, which keeps the
+// church from losing its last administrator.
 func (r *Repo) SetStatus(ctx context.Context, adminID, memberID uuid.UUID, status string) error {
 	tag, err := r.pool.Exec(ctx, `
 		update organization_members target
 		set status = $3
 		where target.id = $2
+		  and target.status = 'pending'
 		  and exists (
 		      select 1 from organization_members admin
 		      where admin.user_id = $1
@@ -277,6 +280,9 @@ func (h *Handler) Router() chi.Router {
 	r.Get("/pending", h.pending)
 	r.Post("/members/{id}/approve", h.approve)
 	r.Post("/members/{id}/reject", h.reject)
+	r.Put("/members/{id}/role", h.setRole)
+	r.Delete("/members/{id}", h.removeMember)
+	r.Post("/members/{id}/reset-code", h.resetCode)
 	r.Get("/palette", h.palette)
 	r.Put("/palette", h.setPalette)
 	r.Get("/notices", h.notices)

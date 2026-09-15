@@ -17,6 +17,7 @@ func (h *Handler) PublicRouter() chi.Router {
 	r.Post("/register", h.register)
 	r.Post("/login", h.login)
 	r.Post("/refresh", h.refresh)
+	r.Post("/reset-password", h.resetPassword)
 	return r
 }
 
@@ -77,6 +78,24 @@ func (h *Handler) refresh(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	httpx.JSON(w, http.StatusOK, session)
+}
+
+// resetPassword takes the code an administrator of the church handed out.
+func (h *Handler) resetPassword(w http.ResponseWriter, r *http.Request) {
+	var body struct {
+		Email       string `json:"email"`
+		Code        string `json:"code"`
+		NewPassword string `json:"new_password"`
+	}
+	if err := httpx.Decode(r, &body); err != nil {
+		httpx.WriteError(w, err)
+		return
+	}
+	if err := h.svc.ResetPassword(r.Context(), body.Email, body.Code, body.NewPassword); err != nil {
+		httpx.WriteError(w, err)
+		return
+	}
+	httpx.NoContent(w)
 }
 
 func (h *Handler) me(w http.ResponseWriter, r *http.Request) {
