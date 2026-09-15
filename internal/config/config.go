@@ -17,6 +17,13 @@ type Config struct {
 	AccessTTL     time.Duration
 	RefreshTTL    time.Duration
 	AllowedOrigin string
+
+	// Password for the owner's dashboard at /stats. Empty turns it off.
+	StatsPassword string
+	// The free DB-IP country database. Missing means blank countries.
+	GeoIPDatabase string
+	// Where the app's releases live, for the website's download buttons.
+	ReleasesRepo string
 }
 
 // Load returns the configuration, or an error naming every missing setting at
@@ -31,6 +38,9 @@ func Load() (Config, error) {
 		AccessTTL:     15 * time.Minute,
 		RefreshTTL:    30 * 24 * time.Hour,
 		AllowedOrigin: env("ALLOWED_ORIGIN", "*"),
+		StatsPassword: os.Getenv("STATS_PASSWORD"),
+		GeoIPDatabase: env("GEOIP_DATABASE", "./dbip-country-lite.mmdb"),
+		ReleasesRepo:  env("RELEASES_REPO", "steven230500/introduce-church"),
 	}
 
 	var missing []string

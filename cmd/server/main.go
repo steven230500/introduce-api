@@ -19,12 +19,14 @@ import (
 	"github.com/steven230500/introduce-api/internal/collections"
 	"github.com/steven230500/introduce-api/internal/config"
 	"github.com/steven230500/introduce-api/internal/db"
+	"github.com/steven230500/introduce-api/internal/geo"
 	"github.com/steven230500/introduce-api/internal/health"
 	"github.com/steven230500/introduce-api/internal/history"
 	"github.com/steven230500/introduce-api/internal/media"
 	"github.com/steven230500/introduce-api/internal/org"
 	"github.com/steven230500/introduce-api/internal/presentation"
 	"github.com/steven230500/introduce-api/internal/songs"
+	"github.com/steven230500/introduce-api/internal/stats"
 	"github.com/steven230500/introduce-api/internal/storage"
 	"github.com/steven230500/introduce-api/internal/templates"
 )
@@ -61,6 +63,7 @@ func main() {
 	tokens := auth.NewTokenIssuer(cfg.JWTSecret, cfg.AccessTTL, cfg.RefreshTTL)
 	authSvc := auth.NewService(authRepo, tokens)
 	hub := presentation.NewHub()
+	locator := geo.Open(cfg.GeoIPDatabase)
 
 	r := chi.NewRouter()
 	r.Use(middleware.RequestID)
@@ -75,12 +78,21 @@ func main() {
 
 	r.Mount("/auth", auth.NewHandler(authSvc).PublicRouter())
 
+	// The website's download buttons, the app's "I was opened", and the owner's
+	// dashboard. Open to anyone; a signed-in app just adds its church.
+	r.Group(func(r chi.Router) {
+		r.Use(authSvc.Identify)
+		stats.NewHandler(
+			stats.NewRepo(pool), stats.NewReleases(cfg.ReleasesRepo), locator, cfg.StatsPassword,
+		).Register(r)
+	})
+
 	// Signed in, but not necessarily in an organization yet: this is where a
 	// new account creates one or asks to join.
 	r.Group(func(r chi.Router) {
 		r.Use(authSvc.Middleware)
 		r.Mount("/account", auth.NewHandler(authSvc).PrivateRouter())
-		r.Mount("/org", org.NewHandler(org.NewRepo(pool), authRepo).Router())
+		r.Mount("/org", org.NewHandler(org.NewRepo(pool), authRepo, locator).Router())
 		r.Mount("/presentation", presentation.NewHandler(presentation.NewRepo(pool), hub).Router())
 	})
 

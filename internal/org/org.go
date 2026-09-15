@@ -15,6 +15,7 @@ import (
 	"github.com/jackc/pgx/v5"
 	"github.com/jackc/pgx/v5/pgxpool"
 	"github.com/steven230500/introduce-api/internal/auth"
+	"github.com/steven230500/introduce-api/internal/geo"
 	"github.com/steven230500/introduce-api/internal/httpx"
 )
 
@@ -63,8 +64,9 @@ func (r *Repo) Membership(ctx context.Context, userID uuid.UUID) (Organization, 
 // Create makes an organization and enrolls the caller as its active admin.
 //
 // Both statements run in one transaction: an organization with no admin would
-// be unreachable and could never approve anyone.
-func (r *Repo) Create(ctx context.Context, userID uuid.UUID, name, email string) (Organization, error) {
+// be unreachable and could never approve anyone. country is where the request
+// came from, as an ISO code, or "" when unknown.
+func (r *Repo) Create(ctx context.Context, userID uuid.UUID, name, email, country string) (Organization, error) {
 	tx, err := r.pool.Begin(ctx)
 	if err != nil {
 		return Organization{}, err
@@ -73,7 +75,7 @@ func (r *Repo) Create(ctx context.Context, userID uuid.UUID, name, email string)
 
 	var o Organization
 	if err := tx.QueryRow(ctx,
-		`insert into organizations (name) values ($1) returning id, name, created_at`, name,
+		`insert into organizations (name, country) values ($1, $2) returning id, name, created_at`, name, country,
 	).Scan(&o.ID, &o.Name, &o.CreatedAt); err != nil {
 		return Organization{}, err
 	}
@@ -184,6 +186,7 @@ func (r *Repo) IsAdmin(ctx context.Context, userID, orgID uuid.UUID) (bool, erro
 type Handler struct {
 	repo *Repo
 	auth *auth.Repo
+	geo  *geo.Locator
 }
 
 // Palette returns the colours this church has saved.
@@ -260,8 +263,8 @@ func (r *Repo) SetNotices(ctx context.Context, orgID uuid.UUID, list []Notice) e
 	return nil
 }
 
-func NewHandler(repo *Repo, authRepo *auth.Repo) *Handler {
-	return &Handler{repo: repo, auth: authRepo}
+func NewHandler(repo *Repo, authRepo *auth.Repo, locator *geo.Locator) *Handler {
+	return &Handler{repo: repo, auth: authRepo, geo: locator}
 }
 
 func (h *Handler) Router() chi.Router {
@@ -449,7 +452,8 @@ func (h *Handler) create(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	o, err := h.repo.Create(r.Context(), userID, strings.TrimSpace(body.Name), user.Email)
+	country := h.geo.Country(geo.ClientIP(r))
+	o, err := h.repo.Create(r.Context(), userID, strings.TrimSpace(body.Name), user.Email, country)
 	if err != nil {
 		httpx.WriteError(w, err)
 		return

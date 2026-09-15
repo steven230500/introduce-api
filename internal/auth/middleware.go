@@ -49,6 +49,35 @@ func (s *Service) Middleware(next http.Handler) http.Handler {
 	})
 }
 
+// Identify is Middleware for routes anyone may call: a valid token puts the
+// caller's identity on the context, and a missing, expired or forged one is
+// ignored instead of rejected. What the route does must not depend on who is
+// asking, only what it records.
+func (s *Service) Identify(next http.Handler) http.Handler {
+	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		raw := bearerToken(r)
+		if raw == "" {
+			next.ServeHTTP(w, r)
+			return
+		}
+		claims, err := s.tokens.ParseAccess(raw)
+		if err != nil {
+			next.ServeHTTP(w, r)
+			return
+		}
+		userID, err := uuid.Parse(claims.Subject)
+		if err != nil {
+			next.ServeHTTP(w, r)
+			return
+		}
+		ctx := context.WithValue(r.Context(), userIDKey, userID)
+		if orgID, err := uuid.Parse(claims.OrgID); err == nil {
+			ctx = context.WithValue(ctx, orgIDKey, orgID)
+		}
+		next.ServeHTTP(w, r.WithContext(ctx))
+	})
+}
+
 // RequireOrg rejects a caller whose token carries no organization.
 //
 // Every content route is org-scoped, so a token minted before the user joined
